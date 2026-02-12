@@ -39,7 +39,7 @@ SHAKESPEARE_URLS = {
 SHAKESPEARE_URL = SHAKESPEARE_URLS[DATASET_SIZE]
 MIN_WORD_FREQUENCY = 3  # Increased since larger vocab (was 2)
 MAX_VOCAB_SIZE = 15000  # Increased for larger corpus (was 10000)
-MAX_SEQ_LENGTH = 64     # Maximum sequence length in words
+MAX_SEQ_LENGTH = 128    # Increased from 64 — longer context helps Shakespeare's long-range dependencies
 
 # =============================================================================
 # EMBEDDING SETTINGS
@@ -125,8 +125,8 @@ SEMANTIC_ANCHORS = {
 NUM_LAYERS = 5          # Number of transformer decoder layers (reduced from 6, 4 was too weak)
 NUM_HEADS = 6           # Number of attention heads (must divide EMBEDDING_DIM)
 FFN_HIDDEN_DIM = 1024   # Feed-forward network hidden dimension (reduced from 1200)
-DROPOUT = 0.3           # Dropout probability (increased from 0.25 to reduce overfitting)
-ATTENTION_DROPOUT = 0.25 # Attention-specific dropout (increased from 0.2)
+DROPOUT = 0.2           # Dropout probability (reduced from 0.3 — BPE model was over-regularised)
+ATTENTION_DROPOUT = 0.15 # Attention-specific dropout (reduced from 0.25)
 
 # =============================================================================
 # TRAINING SETTINGS
@@ -138,6 +138,13 @@ NUM_EPOCHS = 50
 WARMUP_STEPS = 500         # Reduced — fewer batches per epoch now
 GRAD_CLIP_NORM = 1.0
 
+# Contracting stride: stride shrinks each epoch so model sees more overlapping contexts
+# Starts at seq_length (no overlap), halves every STRIDE_CONTRACT_EVERY epochs
+# down to a minimum of STRIDE_MIN
+STRIDE_INITIAL = 128     # Start with no overlap (= seq_length)
+STRIDE_MIN = 16          # Minimum stride (87.5% overlap at seq_length=128)
+STRIDE_CONTRACT_EVERY = 5  # Halve stride every N epochs
+
 # Early stopping
 PATIENCE = 10
 MIN_DELTA = 0.001
@@ -148,7 +155,7 @@ LR_SCHEDULER = "cosine"  # Options: "cosine", "linear", "constant"
 # =============================================================================
 # LOSS SETTINGS
 # =============================================================================
-LABEL_SMOOTHING = 0.15    # Increased from 0.1 for softer targets
+LABEL_SMOOTHING = 0.1     # Reduced from 0.15 — let model be more confident on learned patterns
 SEMANTIC_PRESERVATION_WEIGHT = 0.05  # Weight for anchor preservation loss
 
 # =============================================================================

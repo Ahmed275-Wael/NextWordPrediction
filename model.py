@@ -7,6 +7,8 @@ This module combines:
 3. Generation utilities for text synthesis
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -90,17 +92,31 @@ class ShakespeareTransformer(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize non-pretrained weights"""
+        """
+        Initialize weights following GPT-2/nanoGPT conventions.
+        
+        Key insight: Residual projections (attention out_proj and FFN fc2) are
+        initialised with std = 0.02 / sqrt(2 * num_layers). This prevents the
+        residual stream from growing proportionally to sqrt(N) at init, ensuring
+        stable early training — critical for small datasets where early gradients
+        shape the entire learning trajectory.
+        """
+        residual_std = 0.02 / math.sqrt(2 * config.NUM_LAYERS)
+        
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                # Skip embedding projection if pretrained
                 if module.weight.requires_grad:
-                    nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                    # Scaled init for residual projections, normal init for others
+                    if hasattr(module, '_is_residual') and module._is_residual:
+                        nn.init.normal_(module.weight, mean=0.0, std=residual_std)
+                    else:
+                        nn.init.normal_(module.weight, mean=0.0, std=0.02)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
             elif isinstance(module, nn.LayerNorm):
                 nn.init.ones_(module.weight)
-                nn.init.zeros_(module.bias)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
     
     def forward(
         self,

@@ -51,7 +51,8 @@ class Trainer:
         val_loader: DataLoader,
         test_loader: Optional[DataLoader] = None,
         device: torch.device = config.DEVICE,
-        use_augmentation: bool = True
+        use_augmentation: bool = True,
+        raw_train_data: Optional[list] = None
     ):
         self.model = model
         self.vocab = vocab
@@ -59,6 +60,10 @@ class Trainer:
         self.val_loader = val_loader
         self.test_loader = test_loader
         self.device = device
+        
+        # Raw training data for contracting stride (BPE only)
+        self.raw_train_data = raw_train_data
+        self.current_stride = config.STRIDE_INITIAL if raw_train_data is not None else None
         
         # Data augmentation (word-level only — swapping subwords isn't meaningful)
         if config.TOKENIZER_TYPE == "bpe":
@@ -110,11 +115,13 @@ class Trainer:
         """Create optimizer with differential learning rates"""
         if config.TOKENIZER_TYPE == "bpe":
             # BPE: no pre-trained embeddings, use same LR for everything
+            # beta2=0.99 (not 0.95/0.98) because tokens-per-iter is small
+            # on our ~1M token dataset — stabilises AdamW variance estimates
             optimizer = AdamW(
                 self.model.parameters(),
                 lr=config.LEARNING_RATE,
                 weight_decay=config.WEIGHT_DECAY,
-                betas=(0.9, 0.98),
+                betas=(0.9, 0.99),
                 eps=1e-9
             )
             total_params = sum(1 for p in self.model.parameters())
@@ -140,7 +147,7 @@ class Trainer:
             optimizer = AdamW(
                 param_groups,
                 weight_decay=config.WEIGHT_DECAY,
-                betas=(0.9, 0.98),
+                betas=(0.9, 0.99),
                 eps=1e-9
             )
             
@@ -150,9 +157,37 @@ class Trainer:
         
         return optimizer
     
-    def _create_scheduler(self):
-        """Create learning rate scheduler with warmup"""
-        num_training_steps = len(self.train_loader) * config.NUM_EPOCHS
+    def _estimate_total_steps(self, num_epochs: int) -> int:
+        """
+        Estimate total training steps accounting for contracting strides.
+        
+        Without this, the cosine scheduler thinks training is N × initial_batches steps,
+        but stride contractions increase batches per epoch — causing the cosine cycle
+        to end too early and restart with high LR (which causes overfitting).
+        """
+        if self.raw_train_data is None:
+            # Word-level: constant batch count
+            return len(self.train_loader) * num_epochs
+        
+        # Simulate the stride schedule to count total batches
+        total_steps = 0
+        n_tokens = len(self.raw_train_data)
+        
+        for epoch in range(1, num_epochs + 1):
+            contractions = (epoch - 1) // config.STRIDE_CONTRACT_EVERY
+            stride = max(config.STRIDE_MIN, config.STRIDE_INITIAL >> contractions)
+            n_samples = max(1, (n_tokens - config.MAX_SEQ_LENGTH) // stride)
+            n_batches = (n_samples + config.BATCH_SIZE - 1) // config.BATCH_SIZE
+            total_steps += n_batches
+        
+        return total_steps
+    
+    def _create_scheduler(self, num_epochs: int = config.NUM_EPOCHS):
+        """Create learning rate scheduler with warmup, accounting for stride contractions"""
+        num_training_steps = self._estimate_total_steps(num_epochs)
+        
+        print(f"LR scheduler: {num_training_steps:,} total steps "
+              f"(warmup: {config.WARMUP_STEPS}, cosine: {num_training_steps - config.WARMUP_STEPS})")
         
         # Warmup scheduler
         warmup_scheduler = LinearLR(
@@ -317,6 +352,35 @@ class Trainer:
             'accuracy': correct / total * 100 if total > 0 else 0
         }
     
+    def _maybe_contract_stride(self, epoch: int):
+        """
+        Contracting stride: halve the stride every STRIDE_CONTRACT_EVERY epochs.
+        This progressively increases overlap, giving the model more diverse
+        context windows as training progresses — like zooming in on the data.
+        """
+        if self.raw_train_data is None:
+            return  # word-level mode — no contracting stride
+        
+        # Calculate what stride should be for this epoch
+        contractions = (epoch - 1) // config.STRIDE_CONTRACT_EVERY
+        new_stride = max(config.STRIDE_MIN, config.STRIDE_INITIAL >> contractions)  # >> is integer halving
+        
+        if new_stride != self.current_stride:
+            from data_loader import ShakespeareDataset
+            self.current_stride = new_stride
+            
+            # Rebuild training DataLoader with new stride
+            train_dataset = ShakespeareDataset(
+                self.raw_train_data, config.MAX_SEQ_LENGTH, stride=new_stride
+            )
+            self.train_loader = DataLoader(
+                train_dataset, batch_size=config.BATCH_SIZE, shuffle=True,
+                num_workers=0, pin_memory=config.DEVICE.type == 'cuda'
+            )
+            print(f"  ↳ Stride contracted: {new_stride * 2} → {new_stride} "
+                  f"({len(self.train_loader)} batches, "
+                  f"{100 * (1 - new_stride / config.MAX_SEQ_LENGTH):.0f}% overlap)")
+    
     def train(self, num_epochs: int = config.NUM_EPOCHS) -> Dict:
         """Full training loop"""
         print("\n" + "=" * 70)
@@ -326,12 +390,18 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Training batches: {len(self.train_loader)}")
         print(f"Validation batches: {len(self.val_loader)}")
+        if self.raw_train_data is not None:
+            print(f"Contracting stride: {config.STRIDE_INITIAL} → {config.STRIDE_MIN} "
+                  f"(halving every {config.STRIDE_CONTRACT_EVERY} epochs)")
         print("=" * 70 + "\n")
         
         start_time = time.time()
         
         for epoch in range(1, num_epochs + 1):
             epoch_start = time.time()
+            
+            # Contracting stride: progressively increase overlap
+            self._maybe_contract_stride(epoch)
             
             # Train
             train_loss, train_ppl = self.train_epoch()

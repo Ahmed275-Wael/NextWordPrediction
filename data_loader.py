@@ -496,6 +496,7 @@ def prepare_data(use_cache: bool = True) -> Tuple:
         train_loader: Training dataloader
         val_loader: Validation dataloader
         test_loader: Test dataloader
+        raw_train_data: Raw encoded training tokens for stride rebuilding (None for word-level)
     """
     print("=" * 70)
     print("PREPARING DATA")
@@ -548,8 +549,9 @@ def _prepare_data_bpe(text: str, use_cache: bool = True) -> Tuple:
     print(f"  - Validation: {len(val_data):,} tokens")
     print(f"  - Test:       {len(test_data):,} tokens")
     
-    # Create datasets and dataloaders
-    train_dataset = ShakespeareDataset(train_data, config.MAX_SEQ_LENGTH)
+    # Create datasets with initial stride
+    initial_stride = config.STRIDE_INITIAL
+    train_dataset = ShakespeareDataset(train_data, config.MAX_SEQ_LENGTH, stride=initial_stride)
     val_dataset = ShakespeareDataset(val_data, config.MAX_SEQ_LENGTH)
     test_dataset = ShakespeareDataset(test_data, config.MAX_SEQ_LENGTH)
     
@@ -566,10 +568,11 @@ def _prepare_data_bpe(text: str, use_cache: bool = True) -> Tuple:
         num_workers=0, pin_memory=config.DEVICE.type == 'cuda'
     )
     
-    print(f"\nDataLoaders created:")
+    print(f"\nDataLoaders created (initial stride={initial_stride}):")
     print(f"  - Training batches:   {len(train_loader):,}")
     print(f"  - Validation batches: {len(val_loader):,}")
     print(f"  - Test batches:       {len(test_loader):,}")
+    print(f"  - Stride schedule:    {initial_stride} → {config.STRIDE_MIN} (halving every {config.STRIDE_CONTRACT_EVERY} epochs)")
     
     # BPE uses randomly initialized embeddings (no pre-trained matrix)
     embedding_matrix = None
@@ -579,7 +582,8 @@ def _prepare_data_bpe(text: str, use_cache: bool = True) -> Tuple:
     print("DATA PREPARATION COMPLETE (BPE)")
     print("=" * 70)
     
-    return vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader
+    # Return train_data so Trainer can rebuild DataLoader with contracting stride
+    return vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader, train_data
 
 
 def _prepare_data_word(text: str, use_cache: bool = True) -> Tuple:
@@ -624,7 +628,8 @@ def _prepare_data_word(text: str, use_cache: bool = True) -> Tuple:
     print("DATA PREPARATION COMPLETE (Word-Level)")
     print("=" * 70)
     
-    return vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader
+    # No raw_train_data needed for word-level (no contracting stride)
+    return vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader, None
 
 
 # For testing

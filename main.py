@@ -80,7 +80,7 @@ def parse_args():
 
 
 def train(args, vocab, embedding_matrix, anchor_mappings, 
-          train_loader, val_loader, test_loader):
+          train_loader, val_loader, test_loader, raw_train_data=None):
     """Train the model"""
     print("\n" + "=" * 70)
     print("TRAINING MODE")
@@ -104,7 +104,8 @@ def train(args, vocab, embedding_matrix, anchor_mappings,
         train_loader=train_loader,
         val_loader=val_loader,
         test_loader=test_loader,
-        device=config.DEVICE
+        device=config.DEVICE,
+        raw_train_data=raw_train_data
     )
     
     # Train
@@ -310,7 +311,7 @@ def main():
     
     # Prepare data
     print("\nPreparing data...")
-    vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader = prepare_data()
+    vocab, embedding_matrix, anchor_mappings, train_loader, val_loader, test_loader, raw_train_data = prepare_data()
     
     model = None
     
@@ -318,7 +319,7 @@ def main():
     if args.mode == 'train' or args.mode == 'all':
         model, history = train(
             args, vocab, embedding_matrix, anchor_mappings,
-            train_loader, val_loader, test_loader
+            train_loader, val_loader, test_loader, raw_train_data
         )
     
     if args.mode == 'evaluate' or args.mode == 'all':

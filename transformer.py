@@ -32,7 +32,7 @@ class MultiHeadSelfAttention(nn.Module):
         embed_dim: int = config.EMBEDDING_DIM,
         num_heads: int = config.NUM_HEADS,
         dropout: float = config.ATTENTION_DROPOUT,
-        bias: bool = True
+        bias: bool = False
     ):
         super().__init__()
         
@@ -49,8 +49,9 @@ class MultiHeadSelfAttention(nn.Module):
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         
-        # Output projection
+        # Output projection (residual projection — gets scaled init)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj._is_residual = True
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -146,8 +147,9 @@ class FeedForwardNetwork(nn.Module):
     ):
         super().__init__()
         
-        self.fc1 = nn.Linear(embed_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, embed_dim, bias=False)
+        self.fc2._is_residual = True  # residual projection — gets scaled init
         self.dropout = nn.Dropout(dropout)
         
         # Activation function
@@ -197,9 +199,9 @@ class TransformerDecoderBlock(nn.Module):
     ):
         super().__init__()
         
-        # Layer normalization (Pre-LN)
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        # Layer normalization (Pre-LN, no bias — following GPT-2/PaLM)
+        self.norm1 = nn.LayerNorm(embed_dim, bias=False)
+        self.norm2 = nn.LayerNorm(embed_dim, bias=False)
         
         # Multi-head self-attention
         self.self_attention = MultiHeadSelfAttention(
@@ -288,8 +290,8 @@ class TransformerDecoder(nn.Module):
             for _ in range(num_layers)
         ])
         
-        # Final layer normalization
-        self.final_norm = nn.LayerNorm(embed_dim)
+        # Final layer normalization (no bias — following GPT-2/PaLM)
+        self.final_norm = nn.LayerNorm(embed_dim, bias=False)
         
         # Register causal mask buffer
         self.register_buffer(
@@ -363,19 +365,18 @@ def count_transformer_parameters(
     
     Returns breakdown by component.
     """
-    # Per attention layer
-    # Q, K, V projections: 3 * (embed_dim * embed_dim + embed_dim)
-    # Output projection: embed_dim * embed_dim + embed_dim
-    attention_params = 4 * (embed_dim * embed_dim + embed_dim)
+    # Per attention layer (bias=False)
+    # Q, K, V projections: 3 * embed_dim * embed_dim
+    # Output projection: embed_dim * embed_dim
+    attention_params = 4 * embed_dim * embed_dim
     
-    # Per FFN layer
-    # FC1: embed_dim * ffn_hidden_dim + ffn_hidden_dim
-    # FC2: ffn_hidden_dim * embed_dim + embed_dim
-    ffn_params = (embed_dim * ffn_hidden_dim + ffn_hidden_dim + 
-                  ffn_hidden_dim * embed_dim + embed_dim)
+    # Per FFN layer (bias=False)
+    # FC1: embed_dim * ffn_hidden_dim
+    # FC2: ffn_hidden_dim * embed_dim
+    ffn_params = 2 * embed_dim * ffn_hidden_dim
     
-    # LayerNorm: 2 * embed_dim per layer (2 norms per block)
-    norm_params = 4 * embed_dim
+    # LayerNorm: 1 * embed_dim per norm (weight only, no bias) × 2 norms per block
+    norm_params = 2 * embed_dim
     
     # Per block total
     block_params = attention_params + ffn_params + norm_params
