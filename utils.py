@@ -52,8 +52,9 @@ def load_checkpoint(model, optimizer, scheduler, path: Path):
     """Load model checkpoint"""
     checkpoint = torch.load(path, map_location=config.DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler and checkpoint['scheduler_state_dict']:
+    if optimizer and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler and checkpoint.get('scheduler_state_dict'):
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     epoch = checkpoint['epoch']
     loss = checkpoint['loss']

@@ -1,21 +1,19 @@
 """
-Pre-train on Project Gutenberg → Fine-tune on Shakespeare
+Pre-train on Expanded Project Gutenberg → Fine-tune on Shakespeare
 
 This script implements the pre-training + fine-tuning paradigm:
-1. Downloads ~23MB of classic English literature from Project Gutenberg
+1. Downloads ~300+ classic English texts from Project Gutenberg (~100MB+)
 2. Trains a BPE tokenizer on the combined Gutenberg + Shakespeare corpus
 3. Pre-trains a Transformer on the Gutenberg corpus (broad English understanding)
 4. Fine-tunes the pre-trained model on Shakespeare (domain specialisation)
 
-Chinchilla Principle Applied:
-- Gutenberg corpus ≈ 6M BPE tokens
-- Chinchilla-optimal: 1 param per 20 tokens → 300K params
-- But 300K is too small for complex language patterns
-- Practical compromise: keep our 6.4M param model, but now the ratio is
-  6.4M/6M ≈ 1:1 (vs previous 5.8:1 on Shakespeare alone)
-- This means the model is slightly over-parameterised but NOT catastrophically so
-- The pre-training sees enough data to learn general English patterns
-- Fine-tuning on 1.1M Shakespeare tokens then specialises these patterns
+Chinchilla Scaling Analysis (Hoffmann et al., 2022):
+- Expanded Gutenberg corpus ≈ 25-35M BPE tokens
+- Our Transformer: 6.4M params
+- Chinchilla-optimal: 20 tokens per param → 128M tokens for 6.4M params
+- Actual ratio: ~30M / 6.4M ≈ 4.7:1 (was 0.9:1 with 19 books)
+- This is a 5× improvement in data efficiency over the original 19-book corpus
+- More data → better generalisation → lower fine-tuned PPL on Shakespeare
 
 Usage:
     python pretrain_finetune.py                    # Full pipeline (pretrain + finetune)
@@ -54,47 +52,53 @@ from gutenberg import download_gutenberg_corpus, download_shakespeare
 # ============================================================================
 PRETRAIN_CONFIG = {
     # BPE tokenizer — trained on COMBINED corpus (Gutenberg + Shakespeare)
-    "bpe_vocab_size": 8000,        # Larger vocab for bigger corpus
+    "bpe_vocab_size": 8000,        # 8K vocab for large multi-author corpus
     
-    # Architecture — same as Shakespeare model (Chinchilla says we're
-    # slightly over-parameterised at 6.4M params / 6M tokens, but this
-    # is the practical sweet spot — we need capacity for complex patterns)
-    "num_layers": 5,
-    "num_heads": 6,
-    "embed_dim": 300,
-    "ffn_hidden_dim": 1024,
+    # Architecture — SCALED UP for 50M token corpus
+    # 50M tokens / 22M params ≈ 2.3:1 tokens/param — healthy regime
+    # Fits in 6GB VRAM with batch_size=64, seq_len=128
+    "num_layers": 6,
+    "num_heads": 8,
+    "embed_dim": 512,
+    "ffn_hidden_dim": 2048,
     
-    # Training — gentler for larger corpus
+    # Training — adjusted for larger corpus + bigger model
     "batch_size": 64,
-    "learning_rate": 5e-4,         # Slightly lower than Shakespeare (more data = less aggressive)
+    "learning_rate": 3e-4,         # Slightly lower for bigger model
     "weight_decay": 0.05,
-    "warmup_steps": 1000,          # More warmup for larger dataset
-    "num_epochs": 30,              # Longer training — let contracting strides fully explore the data
-    "patience": 10,                # More patience — give strides time to help
-    "dropout": 0.15,               # Less dropout — more data = less overfitting risk
-    "attention_dropout": 0.1,
+    "warmup_steps": 2000,          # More warmup for much larger dataset
+    "num_epochs": 10,              # 7 epochs @ 128 seq_len + 3 epochs @ 64 seq_len
+    "patience": 8,                 # Less patience — data-rich regime converges faster
+    "dropout": 0.1,                # Lower dropout — lots of data = less overfitting
+    "attention_dropout": 0.05,
     "label_smoothing": 0.1,
     "max_seq_length": 128,
     
-    # Contracting stride
-    "stride_initial": 128,
-    "stride_min": 16,              # Go as low as Shakespeare — let the model see dense overlaps
-    "stride_contract_every": 5,
+    # Sequence length schedule: switch to 64 at epoch 8
+    # Short sequences in final epochs force the model to learn tighter local patterns
+    "seq_len_switch_epoch": 8,     # Switch to short_seq_length at this epoch
+    "short_seq_length": 64,        # Shorter seq for final 3 epochs
     
-    # Paths
-    "model_path": config.MODELS_DIR / "pretrained_gutenberg_v2.pt",
-    "bpe_path": config.DATA_DIR / "bpe_tokenizer_pretrain_8000.json",
+    # Contracting stride — DISABLED for large corpus
+    "stride_initial": 128,
+    "stride_min": 128,             # Same as initial = NO contraction
+    "stride_contract_every": 999,  # Never triggers
+    
+    # Paths — v4 for scaled-up model
+    "model_path": config.MODELS_DIR / "pretrained_gutenberg_v4.pt",
+    "bpe_path": config.DATA_DIR / "bpe_tokenizer_expanded_8000.json",
 }
 
 FINETUNE_CONFIG = {
-    # Fine-tuning — lower LR, more regularisation
-    "learning_rate": 1e-4,         # 5× lower than pre-training (top layer LR)
+    # Fine-tuning — conservative LR to preserve pre-trained representations
+    # Pre-training converged at LR ~1e-6, so we start gently at 3e-5
+    "learning_rate": 3e-5,         # ~10× pre-train's final LR (top layer)
     "weight_decay": 0.1,           # Stronger regularisation
-    "warmup_steps": 200,
-    "num_epochs": 45,              # Longer fine-tuning — let stride schedule run its full course
-    "patience": 12,                # More patience — strides keep opening new learning
-    "dropout": 0.2,                # More dropout for small fine-tune set
-    "attention_dropout": 0.15,
+    "warmup_steps": 150,           # Short warmup — weights already well-initialised
+    "num_epochs": 25,              # Enough room for gradual unfreezing schedule
+    "patience": 8,                 # Patient — unfreezing creates temporary val spikes
+    "dropout": 0.2,                # v4-best dropout setting
+    "attention_dropout": 0.15,     # v4-best attention dropout
     "label_smoothing": 0.1,
     
     # Discriminative fine-tuning (ULMFiT, Howard & Ruder 2018)
@@ -103,13 +107,20 @@ FINETUNE_CONFIG = {
     "discriminative_lr": True,
     "lr_decay_factor": 2.6,        # Howard & Ruder's recommended decay factor
     
-    # Contracting stride — same as BPE v4
-    "stride_initial": 128,
-    "stride_min": 16,
-    "stride_contract_every": 5,
+    # Gradual unfreezing (ULMFiT Phase 2)
+    # Start with only top layer + output head unfrozen.
+    # Every `unfreeze_every` epochs, unfreeze one more layer from top to bottom.
+    # This prevents early gradient noise from corrupting lower pre-trained layers.
+    "gradual_unfreezing": True,
+    "unfreeze_every": 3,           # Unfreeze next layer every N epochs
+    
+    # Fixed stride — v4-best setting
+    "stride_initial": 64,
+    "stride_min": 64,              # Fixed: no contraction
+    "stride_contract_every": 999,  # Effectively disabled
     
     # Paths
-    "model_path": config.MODELS_DIR / "finetuned_shakespeare_v2.pt",
+    "model_path": config.MODELS_DIR / "finetuned_shakespeare_v6.pt",
 }
 
 
@@ -150,10 +161,18 @@ def prepare_pretrain_data(
     
     vocab = BPEVocabulary(bpe)
     
-    # Encode Gutenberg corpus (pre-training data)
-    print(f"\nEncoding Gutenberg corpus...")
-    encoded = bpe.encode(gutenberg_text)
-    print(f"  Encoded: {len(encoded):,} tokens (from {len(gutenberg_text):,} chars)")
+    # Encode Gutenberg corpus in chunks to avoid OOM on large corpora
+    print(f"\nEncoding Gutenberg corpus ({len(gutenberg_text):,} chars)...")
+    CHUNK_SIZE = 10_000_000  # 10M chars per chunk
+    encoded = []
+    for start in range(0, len(gutenberg_text), CHUNK_SIZE):
+        chunk = gutenberg_text[start:start + CHUNK_SIZE]
+        encoded.extend(bpe.encode(chunk))
+        done = min(start + CHUNK_SIZE, len(gutenberg_text))
+        print(f"  Encoded {done:,}/{len(gutenberg_text):,} chars "
+              f"({100*done/len(gutenberg_text):.0f}%) → {len(encoded):,} tokens so far")
+    
+    print(f"  Total: {len(encoded):,} tokens")
     print(f"  Compression: {len(gutenberg_text)/len(encoded):.1f} chars/token")
     
     # Split 90/5/5 (more training data, smaller val/test since we have plenty)
@@ -327,6 +346,15 @@ class PretrainFinetuneTrainer:
         # Early stopping
         self.early_stopping = EarlyStopping(patience=cfg["patience"], min_delta=0.001)
         
+        # Gradual unfreezing state
+        self.gradual_unfreezing = cfg.get("gradual_unfreezing", False) and phase == "finetune"
+        self.unfreeze_every = cfg.get("unfreeze_every", 3)
+        self.num_layers = PRETRAIN_CONFIG["num_layers"]
+        self.unfrozen_from_top = 0  # How many decoder layers are currently unfrozen
+        
+        if self.gradual_unfreezing:
+            self._freeze_all_but_top()
+        
         # History
         self.history = {'train_loss': [], 'val_loss': [], 'train_ppl': [], 'val_ppl': [], 'learning_rates': []}
         self.best_val_loss = float('inf')
@@ -440,6 +468,132 @@ class PretrainFinetuneTrainer:
             )
             print(f"  ↳ Stride contracted → {new_stride} ({len(self.train_loader)} batches)")
     
+    def _freeze_all_but_top(self):
+        """
+        Gradual Unfreezing init (ULMFiT, Howard & Ruder 2018).
+        
+        Freeze everything except:
+          - Top decoder layer (layer N-1)
+          - Final LayerNorm
+          - Output projection (lm_head / tied with embeddings)
+        """
+        num_layers = self.num_layers
+        
+        # Freeze ALL parameters first
+        for param in self.model.parameters():
+            param.requires_grad = False
+        
+        # Unfreeze top decoder layer
+        top_layer_idx = num_layers - 1
+        top_layer_name = f'decoder.layers.{top_layer_idx}.'
+        for name, param in self.model.named_parameters():
+            if top_layer_name in name:
+                param.requires_grad = True
+        
+        # Unfreeze final LayerNorm + output head + any non-layer params
+        for name, param in self.model.named_parameters():
+            # Final norm, output projection
+            if 'decoder.norm' in name or 'output' in name or 'lm_head' in name:
+                param.requires_grad = True
+            # Positional encoding (if learnable)
+            if 'pos' in name.lower() and 'decoder.layers' not in name:
+                param.requires_grad = True
+        
+        self.unfrozen_from_top = 1
+        
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        print(f"  Gradual Unfreezing: frozen {total - trainable:,} / {total:,} params")
+        print(f"    Unfrozen: top decoder layer ({top_layer_idx}) + output head")
+        print(f"    Trainable: {trainable:,} ({trainable/total*100:.1f}%)")
+    
+    def _maybe_unfreeze_layer(self, epoch: int):
+        """
+        Unfreeze next decoder layer every `unfreeze_every` epochs (top to bottom).
+        Also unfreezes embeddings when all decoder layers are unfrozen.
+        Rebuilds optimizer with discriminative LR for the newly unfrozen parameters.
+        """
+        if not self.gradual_unfreezing:
+            return
+        
+        # Check if it's time to unfreeze (epoch 1 already has top layer)
+        if epoch <= 1:
+            return
+        
+        # Unfreeze at epochs: unfreeze_every+1, 2*unfreeze_every+1, ...
+        if (epoch - 1) % self.unfreeze_every != 0:
+            return
+        
+        if self.unfrozen_from_top >= self.num_layers + 1:  # +1 for embeddings
+            return  # Everything already unfrozen
+        
+        if self.unfrozen_from_top < self.num_layers:
+            # Unfreeze next decoder layer (from top toward bottom)
+            layer_idx = self.num_layers - 1 - self.unfrozen_from_top
+            layer_name = f'decoder.layers.{layer_idx}.'
+            unfrozen_count = 0
+            for name, param in self.model.named_parameters():
+                if layer_name in name:
+                    param.requires_grad = True
+                    unfrozen_count += 1
+            self.unfrozen_from_top += 1
+            print(f"  ↳ Unfreezing decoder layer {layer_idx} ({unfrozen_count} params) — "
+                  f"{self.unfrozen_from_top}/{self.num_layers} layers active")
+        else:
+            # All decoder layers unfrozen — now unfreeze embeddings
+            for name, param in self.model.named_parameters():
+                if 'embedding' in name.lower():
+                    param.requires_grad = True
+            self.unfrozen_from_top += 1
+            print(f"  ↳ Unfreezing embeddings — all parameters now trainable")
+        
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.model.parameters())
+        print(f"    Trainable: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
+        
+        # Rebuild optimizer with correct param groups (only trainable params)
+        if self.cfg.get("discriminative_lr", False):
+            self.optimizer = self._create_discriminative_optimizer(self.model, self.cfg)
+        else:
+            self.optimizer = AdamW(
+                [p for p in self.model.parameters() if p.requires_grad],
+                lr=self.cfg["learning_rate"],
+                weight_decay=self.cfg["weight_decay"],
+                betas=(0.9, 0.99), eps=1e-9
+            )
+        
+        # Rebuild scheduler for remaining epochs
+        remaining_steps = len(self.train_loader) * (self.cfg["num_epochs"] - epoch + 1)
+        warmup = min(50, remaining_steps // 4)  # Short warmup after unfreeze
+        warmup_sched = LinearLR(self.optimizer, start_factor=0.3, end_factor=1.0, total_iters=warmup)
+        cosine_sched = CosineAnnealingLR(self.optimizer, T_max=max(1, remaining_steps - warmup), eta_min=1e-6)
+        self.scheduler = SequentialLR(self.optimizer, [warmup_sched, cosine_sched], milestones=[warmup])
+    
+    def _maybe_switch_seq_length(self, epoch: int):
+        """Switch to shorter sequence length at specified epoch for tighter pattern learning"""
+        switch_epoch = self.cfg.get("seq_len_switch_epoch")
+        short_len = self.cfg.get("short_seq_length")
+        if switch_epoch is None or short_len is None:
+            return
+        if epoch < switch_epoch:
+            return
+        if self.cfg["max_seq_length"] == short_len:
+            return  # Already switched
+        
+        print(f"  ↳ Switching seq_length: {self.cfg['max_seq_length']} → {short_len} (epoch {epoch})")
+        self.cfg["max_seq_length"] = short_len
+        
+        # Rebuild all dataloaders with new seq_length
+        if self.raw_train_data is not None:
+            stride = self.current_stride or self.cfg["stride_initial"]
+            train_ds = ShakespeareDataset(self.raw_train_data, short_len, stride=stride)
+            pin = config.DEVICE.type == 'cuda'
+            self.train_loader = DataLoader(
+                train_ds, batch_size=self.cfg["batch_size"], shuffle=True,
+                num_workers=0, pin_memory=pin
+            )
+            print(f"    Train: {len(self.train_loader):,} batches (seq_len={short_len})")
+    
     def train_epoch(self) -> Tuple[float, float]:
         """Train for one epoch"""
         self.model.train()
@@ -518,13 +672,13 @@ class PretrainFinetuneTrainer:
             'accuracy': correct / total * 100 if total > 0 else 0
         }
     
-    def train_loop(self) -> Dict:
-        """Full training loop"""
+    def train_loop(self, start_epoch: int = 1) -> Dict:
+        """Full training loop with optional resume from start_epoch"""
         num_epochs = self.cfg["num_epochs"]
         save_path = self.cfg["model_path"]
         
         print(f"\n{'='*70}")
-        print(f"STARTING {self.phase.upper()} ({num_epochs} epochs)")
+        print(f"STARTING {self.phase.upper()} ({num_epochs} epochs, from epoch {start_epoch})")
         print(f"{'='*70}")
         print(f"  Train batches: {len(self.train_loader):,}")
         print(f"  Val batches:   {len(self.val_loader):,}")
@@ -534,9 +688,11 @@ class PretrainFinetuneTrainer:
         
         start = time.time()
         
-        for epoch in range(1, num_epochs + 1):
+        for epoch in range(start_epoch, num_epochs + 1):
             t0 = time.time()
+            self._maybe_unfreeze_layer(epoch)
             self._maybe_contract_stride(epoch)
+            self._maybe_switch_seq_length(epoch)
             
             train_loss, train_ppl = self.train_epoch()
             val_loss, val_ppl = self.validate()
@@ -624,12 +780,26 @@ def run_pretrain(args) -> Tuple[ShakespeareTransformer, BPEVocabulary]:
     for key, val in old_vals.items():
         setattr(config, key, val)
     
+    # Resume from checkpoint if requested
+    start_epoch = 1
+    if args.resume and Path(cfg["model_path"]).exists():
+        from utils import load_checkpoint as _load_ckpt
+        start_epoch, best_loss = _load_ckpt(model, None, None, cfg["model_path"])
+        # Load only model weights — optimizer/scheduler will be recreated fresh
+        start_epoch += 1  # Continue from next epoch
+        print(f"  Resuming from epoch {start_epoch} (best loss: {best_loss:.4f})")
+    
     # Train
     trainer = PretrainFinetuneTrainer(
         model, vocab, train_loader, val_loader, test_loader,
         cfg, raw_train_data=train_tokens, phase="pretrain"
     )
-    history = trainer.train_loop()
+    
+    if args.resume and start_epoch > 1:
+        trainer.best_val_loss = best_loss
+        trainer.best_epoch = start_epoch - 1
+    
+    history = trainer.train_loop(start_epoch=start_epoch)
     
     # Evaluate on pre-training test set
     print("\n" + "=" * 70)
@@ -891,6 +1061,7 @@ def parse_args():
                         choices=['all', 'pretrain', 'finetune', 'evaluate', 'generate'],
                         help='all=pretrain+finetune, or run a single phase')
     parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint path')
+    parser.add_argument('--resume', action='store_true', help='Resume training from last checkpoint')
     parser.add_argument('--prompt', type=str, default='to be or not to be', help='Generation prompt')
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--max_length', type=int, default=100)
