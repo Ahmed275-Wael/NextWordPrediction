@@ -236,7 +236,7 @@ def clean_gutenberg_text(text: str) -> str:
     # Remove table of contents and other non-play content
     # The actual plays start after "THE SONNETS" section
     
-    print(f"Cleaned Gutenberg text: {len(text):,} → {len(cleaned):,} characters")
+    print(f"Cleaned Gutenberg text: {len(text):,} -> {len(cleaned):,} characters")
     return cleaned
 
 
@@ -396,7 +396,7 @@ def align_embeddings_with_fasttext(
     if anchor_mappings:
         print(f"\nSemantic Anchors Used ({len(anchor_mappings)}):")
         for archaic, modern in list(anchor_mappings.items())[:10]:
-            print(f"  '{archaic}' → '{modern}'")
+            print(f"  '{archaic}' -> '{modern}'")
         if len(anchor_mappings) > 10:
             print(f"  ... and {len(anchor_mappings) - 10} more")
     
@@ -572,7 +572,7 @@ def _prepare_data_bpe(text: str, use_cache: bool = True) -> Tuple:
     print(f"  - Training batches:   {len(train_loader):,}")
     print(f"  - Validation batches: {len(val_loader):,}")
     print(f"  - Test batches:       {len(test_loader):,}")
-    print(f"  - Stride schedule:    {initial_stride} → {config.STRIDE_MIN} (halving every {config.STRIDE_CONTRACT_EVERY} epochs)")
+    print(f"  - Stride schedule:    {initial_stride} -> {config.STRIDE_MIN} (halving every {config.STRIDE_CONTRACT_EVERY} epochs)")
     
     # BPE uses randomly initialized embeddings (no pre-trained matrix)
     embedding_matrix = None
@@ -622,7 +622,9 @@ def _prepare_data_word(text: str, use_cache: bool = True) -> Tuple:
             save_embeddings_cache(vocab, embedding_matrix, anchor_mappings, cache_path)
     
     # 6. Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(tokens, vocab)
+    train_loader, val_loader, test_loader = create_dataloaders(
+        tokens, vocab, seq_length=config.MAX_SEQ_LENGTH
+    )
     
     print("\n" + "=" * 70)
     print("DATA PREPARATION COMPLETE (Word-Level)")

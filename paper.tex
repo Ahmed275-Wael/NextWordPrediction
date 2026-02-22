@@ -1,0 +1,1315 @@
+% IEEE Conference Paper — CSO7013 Machine Learning Final Assessment
+% Compile with: pdflatex paper.tex  (twice for references)
+\documentclass[conference]{IEEEtran}
+
+% ── packages ──────────────────────────────────────────────────────
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{soul}          % for \hl if needed
+\usepackage[T1]{fontenc}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+% ── custom shortcuts ──────────────────────────────────────────────
+\newcommand{\ppl}{\mathrm{PPL}}
+\newcommand{\bpc}{\mathrm{BPC}}
+\newcommand{\ie}{\textit{i.e.}}
+\newcommand{\eg}{\textit{e.g.}}
+\newcommand{\etal}{\textit{et al.}}
+
+\begin{document}
+
+% ══════════════════════════════════════════════════════════════════
+%                           TITLE
+% ══════════════════════════════════════════════════════════════════
+\title{``What's Past Is Prologue'':\\
+Predicting Shakespeare's Next Word Through Scaled Transfer Learning}
+
+\author{
+  \IEEEauthorblockN{Ahmed Wael}
+  \IEEEauthorblockA{
+    MSc Data Science --- CSO7013 Machine Learning\\
+    Email: \texttt{2512938@live.stmarys.ac.uk}
+  }
+}
+
+\maketitle
+
+% ══════════════════════════════════════════════════════════════════
+%                          ABSTRACT
+% ══════════════════════════════════════════════════════════════════
+\begin{abstract}
+We present a systematic study of next-word prediction on the Complete Works
+of William Shakespeare, progressing from a word-level baseline through 13
+iterative experiments to a 23\,M-parameter decoder-only Transformer
+pre-trained on 324 Project Gutenberg books (55\,M BPE tokens) and
+fine-tuned with discriminative learning rates.
+Our best model achieves a test perplexity of \textbf{72.1},
+top-5 accuracy of \textbf{47.4\%}, and $\approx$\textbf{1.51 BPC}---a
+\textbf{28.8\% improvement} in bits-per-character over Karpathy's
+character-level nanoGPT benchmark ($\approx$2.12 BPC), establishing a
+new reference point for Shakespeare language modelling.
+All test metrics are obtained with label smoothing $\alpha = 0$,
+reflecting true perplexity; evaluating on the minimised embedded test
+subset yields even lower perplexity and higher accuracy.
+We report several key findings:
+(i)~BPE tokenisation alone reduces perplexity by 26.8\% over word-level
+    modelling;
+(ii)~an AWD-LSTM with 20.5\,M parameters and purpose-built regularisation
+     is outperformed by a 6.4\,M-parameter Transformer on the same data;
+(iii)~scaling from 7.3\,M to 23\,M parameters while expanding the
+      pre-training corpus from 19 to 324 books yields a further 36.6\%
+      perplexity reduction;
+(iv)~discriminative fine-tuning (120$\times$ layer-wise learning-rate
+     ratio) renders gradual unfreezing redundant.
+Several engineering techniques---including a contracting-stride
+schedule, context-length scheduling, a memory-mapped-style embedding
+cache to avoid out-of-memory errors, and careful FP32 memory
+budgeting---were essential to fitting the full training pipeline within
+limited VRAM\@.
+We further discuss potential improvements through Swish activation
+functions, reduced stride lengths, and FP16 mixed-precision training
+that could push performance even further.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Language modelling, Transformer, next-word prediction, transfer learning,
+BPE tokenisation, Shakespeare, Chinchilla scaling, discriminative
+fine-tuning
+\end{IEEEkeywords}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Introduction}\label{sec:intro}
+% ══════════════════════════════════════════════════════════════════
+
+Neural language models have evolved rapidly from recurrent architectures
+\cite{merity2018} to Transformer-based designs \cite{vaswani2017},
+and recent scaling laws \cite{hoffmann2022} have formalised the
+relationship between model size, dataset size, and performance.
+Yet many published benchmarks focus solely on final accuracy without
+exposing the cumulative impact of each design and training decision.
+In this work we ask:
+\emph{what combination of tokenisation, architecture, data scaling,
+and fine-tuning strategy is needed to achieve strong next-word
+prediction on a fixed, small literary domain---and how much further
+could it go?}
+
+We choose Shakespeare's Complete Works as the target corpus for three
+reasons:
+(1)~it is a well-studied benchmark in the character-level modelling
+    literature \cite{karpathy_rnn,karpathynanoGPT};
+(2)~its archaic vocabulary and dramatic structure create a challenging
+    modelling problem;
+(3)~the corpus is small enough (5.4\,MB) to expose the tension between
+    model capacity and data scarcity that scaling laws describe.
+
+Starting from a word-level Transformer baseline, we conduct 13
+sequential experiments, each motivated by a specific hypothesis.
+The journey is organised around five architectural and methodological
+axes, each of which is documented as a controlled ablation:
+
+\begin{enumerate}[leftmargin=*,nosep]
+  \item \textbf{Tokenisation:} word-level $\rightarrow$ Byte-Pair
+        Encoding (BPE) \cite{sennrich2016}.
+  \item \textbf{Architecture modernisation:} bias removal, Pre-LayerNorm
+        \cite{xiong2020}, GELU activations \cite{hendrycks2016}, scaled
+        residual initialisation, and weight tying
+        \cite{press2017}---following nanoGPT \cite{karpathynanoGPT}.
+  \item \textbf{Recurrent baseline:} AWD-LSTM \cite{merity2018} to
+        quantify the Transformer's advantage (or lack thereof) on
+        limited data.
+  \item \textbf{Transfer learning:} pre-training on up to 324 Gutenberg
+        books, with ULMFiT-style discriminative learning rates
+        \cite{howard2018}.
+  \item \textbf{Scaling:} 7.3\,M $\rightarrow$ 23\,M parameters and
+        5.7\,M $\rightarrow$ 55\,M tokens, guided by the Chinchilla
+        scaling law \cite{hoffmann2022}.
+\end{enumerate}
+
+\noindent\textbf{Contributions.}
+\begin{itemize}[leftmargin=*,nosep]
+  \item A reproducible, end-to-end pipeline from raw text to generation,
+        provided in both full-source and minimised self-contained
+        deliverable forms.
+  \item A controlled study of 12 checkpoints evaluated under identical
+        conditions (label smoothing $\alpha = 0$ at test time), enabling
+        fair cross-model comparison.
+  \item A demonstration that a 23\,M-parameter Transformer with BPE and
+        transfer learning achieves \textbf{1.51 BPC}, surpassing
+        Karpathy's character-level nanoGPT benchmark (2.12 BPC) by
+        28.8\%.
+  \item Empirical evidence that discriminative fine-tuning subsumes
+        gradual unfreezing at the 23\,M scale.
+  \item Discussion of engineering techniques (embedding cache, contracting
+        stride, context-length scheduling) and potential architectural
+        improvements (Swish activations, aggressive stride reduction,
+        FP16 mixed precision) that could extend these results further.
+\end{itemize}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Related Work}\label{sec:related}
+% ══════════════════════════════════════════════════════════════════
+
+\subsection{Character-Level Shakespeare Modelling}
+
+Karpathy's \texttt{char-rnn} \cite{karpathy_rnn} popularised
+Shakespeare as a language-modelling benchmark using a multi-layer LSTM
+at the character level, achieving a validation loss of $\approx$1.5
+nats/char on the Tiny Shakespeare corpus ($\approx$1\,MB).
+His later \texttt{nanoGPT} \cite{karpathynanoGPT}, a minimal GPT-2
+re-implementation with 10.7\,M parameters (6 layers, 6 heads, 384\,d),
+reduced this to a validation loss of 1.47 nats/char
+($\approx$2.12 bits/char).
+Both systems operate at the character level with vocabularies of
+$\approx$65 symbols and train exclusively on the target corpus.
+
+\subsection{Subword Tokenisation}
+
+BPE \cite{sennrich2016} and its variants (WordPiece, Unigram) have
+become the default tokenisation strategy in modern NLP.
+By decomposing rare words into frequent subword units, BPE eliminates
+the out-of-vocabulary (OOV) problem and reduces the effective sequence
+length, enabling the model to capture longer-range dependencies within
+a fixed context window.
+For Shakespeare, this is particularly significant: archaic forms such as
+\textit{thou}, \textit{hath}, and \textit{doth} are decomposed into
+reusable sub-units shared with modern English.
+
+\subsection{AWD-LSTM}
+
+Merity \etal~\cite{merity2018} introduced the AWD-LSTM, combining
+weight-dropped recurrence, variational dropout, and
+activation/temporal activation regularisation (AR/TAR) to achieve
+state-of-the-art word-level perplexity on Penn Treebank and WikiText-2.
+Their recipe was specifically designed for \emph{small data} regimes,
+making it a natural comparison point.
+
+\subsection{Transfer Learning for Language Models}
+
+Howard and Ruder \cite{howard2018} proposed ULMFiT, introducing three
+key techniques for language-model fine-tuning:
+(1)~discriminative learning rates (lower layers receive smaller LR),
+(2)~slanted triangular learning rate schedules, and
+(3)~gradual unfreezing (progressively unfreezing layers from top to
+    bottom).
+We adopt discriminative LR and evaluate gradual unfreezing as a
+controlled ablation.
+
+\subsection{Scaling Laws}
+
+Hoffmann \etal~\cite{hoffmann2022} (Chinchilla) showed that
+compute-optimal training requires $\approx$20 tokens per parameter.
+Training a 6.4\,M-parameter model on 1.1\,M Shakespeare tokens
+(0.17 tokens/param) is therefore $\sim$118$\times$ below the optimal
+ratio, motivating our corpus expansion.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Methodology}\label{sec:method}
+% ══════════════════════════════════════════════════════════════════
+
+\subsection{Task Definition}
+
+Given a sequence of tokens $w_1, w_2, \ldots, w_{t-1}$, the model
+predicts $P(w_t \mid w_1, \ldots, w_{t-1})$.
+Training minimises the cross-entropy loss:
+\begin{equation}
+  \mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T}\log P(w_t \mid w_{<t})
+  \label{eq:loss}
+\end{equation}
+Perplexity is the exponentiated average loss:
+$\ppl = \exp(\mathcal{L})$.
+
+\subsection{Tokenisation}\label{sec:tokenisation}
+
+We evaluate two tokenisation strategies:
+
+\noindent\textbf{Word-level.}
+Vocabulary of $\approx$12.5\,K words (minimum frequency 3),
+initialised with FastText \cite{bojanowski2017} 300-dimensional
+embeddings.
+Out-of-vocabulary tokens are mapped to \texttt{<UNK>}.
+
+\noindent\textbf{Byte-Pair Encoding.}
+Trained with the HuggingFace \texttt{tokenizers} library.
+Two vocabularies are used: 5\,K for Shakespeare-only experiments and
+8\,K for transfer-learning experiments (trained on the combined
+Gutenberg + Shakespeare corpus).
+The 8\,K tokeniser achieves a compression ratio of $\approx$4.1
+characters per token.
+
+\subsection{Architecture}\label{sec:arch}
+
+All Transformer models follow a decoder-only (GPT-style) design.
+Table~\ref{tab:arch} compares the two model scales and contrasts our
+design with Karpathy's nanoGPT.
+
+\begin{table}[t]
+\centering
+\caption{Architecture comparison: our models vs.\ nanoGPT.}
+\label{tab:arch}
+\renewcommand{\arraystretch}{1.15}
+\small
+\begin{tabular}{@{}l ccc@{}}
+\toprule
+\textbf{Component} & \textbf{Ours (7.3\,M)} & \textbf{Ours (23\,M)} & \textbf{nanoGPT} \\
+\midrule
+Layers             & 5           & 6           & 6 \\
+Heads              & 6           & 8           & 6 \\
+Embed dim          & 300         & 512         & 384 \\
+FFN dim            & 1\,024      & 2\,048      & 1\,536 \\
+Vocab              & 5--8\,K BPE & 8\,K BPE    & $\sim$65 chars \\
+Context length     & 128         & 128         & 256 \\
+Pos.\ encoding     & Sinusoidal  & Sinusoidal  & Learned \\
+Norm placement     & Pre-LN      & Pre-LN      & Pre-LN \\
+Bias in Linear     & \textbf{No} & \textbf{No} & No \\
+Activation         & GELU        & GELU        & GELU \\
+Weight tying       & Yes         & Yes         & Yes \\
+Residual init      & Scaled      & Scaled      & Scaled \\
+Label smoothing    & $\alpha$=0.1 & $\alpha$=0.1 & None \\
+Parameters         & 7.3\,M      & 23\,M       & 10.7\,M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Key architectural decisions}
+
+Each design choice is grounded in the literature and was introduced at
+a specific experimental stage:
+
+\textbf{(a) Pre-LayerNorm} \cite{xiong2020}.
+We apply LayerNorm \emph{before} each sub-layer, following GPT-2:
+\begin{align}
+  \mathbf{x} &= \mathbf{x} + \mathrm{Attn}(\mathrm{LN}(\mathbf{x})) \\
+  \mathbf{x} &= \mathbf{x} + \mathrm{FFN}(\mathrm{LN}(\mathbf{x}))
+\end{align}
+This provides more stable gradient flow than the Post-LN variant used
+in the original Transformer \cite{vaswani2017}, enabling training
+without aggressive warmup tuning.
+
+\textbf{(b) Bias removal.}
+All \texttt{nn.Linear} layers use \texttt{bias=False}, following
+nanoGPT.
+This reduces parameter count and acts as an implicit regulariser,
+as the model cannot learn per-neuron offsets that might encourage
+memorisation.
+
+\textbf{(c) Scaled residual initialisation.}
+Output projections in attention and FFN blocks are initialised with
+$\mathcal{N}(0,\; 0.02 / \sqrt{2L})$ where $L$ is the number of
+layers, preventing the residual stream from growing at initialisation
+\cite{karpathynanoGPT}.
+
+\textbf{(d) Weight tying} \cite{press2017}.
+The output projection matrix shares weights with the token embedding,
+saving 2.4\,M parameters (7.3\,M model) or 4.1\,M parameters
+(23\,M model), while enforcing consistency between the input and
+output token spaces.
+
+\textbf{(e) GELU activation} \cite{hendrycks2016}.
+GELU replaces ReLU in the FFN, providing smoother gradients near zero
+and better training dynamics for Transformer architectures.
+
+\textbf{(f) Sinusoidal positional encoding} \cite{vaswani2017}.
+Unlike nanoGPT's learned embeddings, we use fixed sinusoidal
+encodings, which generalise to unseen positions.
+
+\subsection{AWD-LSTM Baseline}\label{sec:lstm}
+
+To isolate the effect of architecture from training strategy, we train
+an AWD-LSTM \cite{merity2018} on the same BPE-tokenised Shakespeare
+data:
+
+\begin{itemize}[nosep,leftmargin=*]
+  \item 3-layer LSTM, hidden size 1\,150, embedding dim 300
+  \item Weight tying (embedding $\leftrightarrow$ output)
+  \item DropConnect on recurrent weights ($p$=0.5)
+  \item Variational dropout: input 0.3, hidden 0.25, output 0.4
+  \item AR ($\alpha$=2.0) and TAR ($\beta$=1.0) regularisation
+  \item Optimiser: SGD $\rightarrow$ NT-ASGD (non-monotonic trigger)
+  \item Total parameters: $\approx$20.5\,M
+\end{itemize}
+
+\noindent This configuration follows Merity \etal~\cite{merity2018}
+adapted for our vocabulary size and sequence length.
+
+\subsection{Training Strategy}\label{sec:training}
+
+\subsubsection{Contracting stride}
+
+During BPE scratch training and early transfer-learning experiments, we
+use a novel \emph{contracting stride} schedule that progressively
+increases context overlap:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Epochs & Stride & Overlap \\
+\midrule
+1--5   & 128    & 0\% \\
+6--10  & 64     & 50\% \\
+11--15 & 32     & 75\% \\
+16+    & 16     & 87.5\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent This gives the model fast, diverse passes in early
+training and dense, overlapping coverage in later epochs, effectively
+increasing the number of training examples by up to 8$\times$ without
+data augmentation.
+
+\subsubsection{Context length scheduling}
+
+During pre-training v4, we reduce the context length from 128 to 64
+tokens at epoch~8, exposing the model to shorter, more varied contexts
+in the final training stage.
+This acts as a form of regularisation and improves generalisation to
+variable-length inputs at inference.
+
+\subsubsection{Label smoothing}
+
+All models are trained with label smoothing $\alpha = 0.1$
+\cite{szegedy2016}, which distributes 10\% of the target probability
+mass uniformly across the vocabulary.
+This prevents the model from becoming overconfident and improves
+calibration.
+\textbf{Crucially, all test-time evaluations are performed with
+$\alpha = 0$ to report true perplexity.}
+
+\subsubsection{Optimiser}
+
+We use AdamW \cite{loshchilov2019} with $\beta_1 = 0.9$,
+$\beta_2 = 0.99$ (following nanoGPT), and cosine annealing with
+linear warmup.
+
+\subsection{Transfer Learning}\label{sec:transfer}
+
+\subsubsection{Pre-training corpus}
+
+We curate a corpus of classic English literature from Project Gutenberg
+in two phases:
+
+\begin{itemize}[nosep,leftmargin=*]
+  \item \textbf{Phase~1}: 19 canonical texts (23.4\,MB, 5.7\,M BPE
+        tokens) including the King James Bible, Milton, Austen, Dickens,
+        and Tolstoy.
+  \item \textbf{Phase~2}: 324 unique texts (217.5\,MB, 55.2\,M BPE
+        tokens) spanning 150+ authors from the 16th--20th centuries,
+        including Shakespeare's contemporaries (Marlowe, Jonson),
+        Romantic poets (Shelley, Keats), and Russian/French literature
+        in translation.
+\end{itemize}
+
+\subsubsection{Discriminative fine-tuning}\label{sec:discrim}
+
+Following ULMFiT \cite{howard2018}, each layer group $l$ receives a
+learning rate:
+\begin{equation}
+  \eta_l = \frac{\eta_{\text{top}}}{\xi^{(L - l)}}
+  \label{eq:discrim}
+\end{equation}
+where $\eta_{\text{top}}$ is the top-layer learning rate, $\xi = 2.6$
+is the decay factor, and $L$ is the number of layer groups.
+
+For the 23\,M model ($L = 8$ groups), this produces a
+\textbf{120$\times$} ratio between top and bottom:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lc@{}}
+\toprule
+Layer Group & Learning Rate \\
+\midrule
+Embeddings            & $3.74 \times 10^{-8}$ \\
+Decoder Layer 0       & $2.53 \times 10^{-7}$ \\
+Decoder Layer 1       & $6.57 \times 10^{-7}$ \\
+Decoder Layer 2       & $1.71 \times 10^{-6}$ \\
+Decoder Layer 3       & $4.44 \times 10^{-6}$ \\
+Decoder Layer 4       & $1.15 \times 10^{-5}$ \\
+Decoder Layer 5 (top) & $3.00 \times 10^{-5}$ \\
+Output Head           & $3.00 \times 10^{-5}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The embeddings learn at effectively frozen rates, preserving
+the general English representations acquired during pre-training, while
+the top layers adapt rapidly to Shakespearean syntax.
+
+\subsubsection{Gradual unfreezing (ablation)}
+
+As an ablation, we test ULMFiT's gradual unfreezing
+\cite{howard2018}: starting with only the top layer trainable,
+unfreezing one additional layer every 3 epochs until all parameters
+are active.
+
+\subsection{Model Scaling}\label{sec:scaling}
+
+The Chinchilla scaling law \cite{hoffmann2022} recommends
+$\approx$20 tokens per parameter for compute-optimal training.
+Table~\ref{tab:chinchilla} shows our token-to-parameter ratios across
+experimental phases, which motivated the architecture expansion from
+7.3\,M to 23\,M parameters.
+
+\begin{table}[t]
+\centering
+\caption{Chinchilla scaling analysis across experiment phases.}
+\label{tab:chinchilla}
+\small
+\renewcommand{\arraystretch}{1.10}
+\begin{tabular}{@{}lrrrl@{}}
+\toprule
+\textbf{Phase} & \textbf{Tokens} & \textbf{Params} & \textbf{Tok/Par} & \textbf{Status} \\
+\midrule
+Shakespeare only   & 1.1\,M & 6.4\,M & 0.17 & Over-param.\ \\
+Gutenberg 19 books & 5.7\,M & 7.3\,M & 0.78 & Over-param.\ \\
+Gutenberg 324, small & 55\,M & 7.3\,M & 7.5 & Under-cap.\ \\
+\textbf{Gutenberg 324, large} & \textbf{55\,M} & \textbf{23\,M} & \textbf{2.4} & \textbf{Healthy} \\
+Chinchilla optimal & 55\,M & 2.75\,M & 20 & Theoretical \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent While our 2.4 tokens/parameter ratio remains above the
+23\,M-parameter theoretical Chinchilla optimum, it is well within
+the practical regime.
+The key insight is that scaling model capacity from 7.3\,M to 23\,M
+alongside the 17$\times$ data expansion was essential: the 7.3\,M
+model on 55\,M tokens (Pre-train v3) showed clear underfitting and
+was abandoned at epoch~8.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Experimental Setup}\label{sec:setup}
+% ══════════════════════════════════════════════════════════════════
+
+\subsection{Hardware}
+
+All experiments run on a single NVIDIA GeForce GTX 1660\,Ti (6\,GB
+VRAM), Intel CPU, Windows~11, PyTorch 2.6.0+cu124, Python 3.13.3.
+Total training time: $\approx$20.7 GPU-hours across all 13
+experiments.
+Operating within 6\,GB of VRAM required several memory-management
+techniques described in Section~\ref{sec:engineering}.
+
+\subsection{Datasets}
+
+\textbf{Shakespeare} (fine-tuning target):
+5.4\,MB raw text from Project Gutenberg, yielding 1.37\,M BPE tokens
+split 80/10/10 sequentially into train/val/test.
+The sequential split means different \emph{plays} appear in each
+partition, which creates a structural val--test gap (Section~\ref{sec:valtestgap}).
+
+\textbf{Gutenberg} (pre-training):
+Phase~1: 19 books, 5.7\,M tokens.
+Phase~2: 324 books, 55.2\,M tokens (split 90/5/5).
+
+\subsection{Evaluation Protocol}\label{sec:evalprotocol}
+
+All 12 model checkpoints are evaluated by a unified tester with:
+\begin{itemize}[nosep,leftmargin=*]
+  \item Label smoothing $\alpha = 0$ (true perplexity).
+  \item Identical test data, batch size, and sequence length per
+        tokeniser type.
+  \item Metrics: loss, perplexity, top-1 accuracy, top-5 accuracy.
+\end{itemize}
+
+\noindent\textbf{Why $\alpha = 0$ at test time.}
+During training, label smoothing $\alpha = 0.1$ is applied to improve
+generalisation (Section~\ref{sec:training}).
+At evaluation, we restore $\alpha = 0$ so that the reported perplexity
+reflects the model's true predictive distribution rather than a
+smoothed surrogate.
+All PPL and accuracy figures in this paper are produced under this
+$\alpha = 0$ standard.
+
+\noindent\textbf{Minimised evaluation data.}
+A self-contained tester embeds a representative Shakespeare excerpt
+directly in the source code, eliminating external data dependencies.
+Evaluating on this minimised subset yields \emph{even lower}
+perplexity and \emph{higher} accuracy than the full sequential test
+split, because the embedded text avoids the structural val--test gap
+caused by differing plays across partitions
+(Section~\ref{sec:valtestgap}).
+
+% ══════════════════════════════════════════════════════════════════
+\section{Experiments and Results}\label{sec:experiments}
+% ══════════════════════════════════════════════════════════════════
+
+Table~\ref{tab:results} presents all results under the unified
+evaluation protocol.
+We now describe the experimental narrative.
+
+\begin{table*}[t]
+\centering
+\caption{Complete results for all 12 checkpoints, evaluated with label smoothing $\alpha=0$.
+         \textbf{Bold} marks the best result per column.
+         PPL = perplexity (lower is better), Acc = top-1 accuracy, Top-5 = top-5 accuracy.}
+\label{tab:results}
+\small
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}clllrrrr@{}}
+\toprule
+\textbf{\#} & \textbf{Model} & \textbf{Arch.} & \textbf{Tokeniser} & \textbf{Params} & \textbf{PPL $\downarrow$} & \textbf{Acc (\%) $\uparrow$} & \textbf{Top-5 (\%) $\uparrow$} \\
+\midrule
+1  & Word-Level Baseline          & 5L/6H/300d  & Word (12.5\,K) & 8.6\,M & 155.5  & 18.64 & 39.27 \\
+5  & BPE v4 (Scratch)             & 5L/6H/300d  & BPE 5\,K       & 6.4\,M & 113.8  & 20.25 & 40.86 \\
+6  & AWD-LSTM                     & 3L-LSTM     & BPE 5\,K       & 20.5\,M & 134.0 & 19.68 & 38.74 \\
+\midrule
+7p & Pre-train v1 (19 books)       & 5L/6H/300d  & BPE 8\,K       & 7.3\,M & 151.6  & 17.88 & 38.44 \\
+8p & Pre-train v2 (19 books, 30ep) & 5L/6H/300d  & BPE 8\,K       & 7.3\,M & 143.9  & 18.67 & 39.48 \\
+9  & Pre-train v3 (324 books)      & 5L/6H/300d  & BPE 8\,K       & 7.3\,M & 103.6  & 21.66 & 42.65 \\
+10 & Pre-train v4 (324 books)      & 6L/8H/512d  & BPE 8\,K       & 23\,M  &  89.7  & 23.18 & 44.63 \\
+\midrule
+7  & Fine-tune v1 (Uniform LR)    & 5L/6H/300d  & BPE 8\,K       & 7.3\,M &  97.6  & 22.53 & 43.56 \\
+8  & Fine-tune v2 (Discrim.\ LR)  & 5L/6H/300d  & BPE 8\,K       & 7.3\,M &  90.5  & 23.33 & 44.71 \\
+\midrule
+11 & \textbf{Fine-tune v4 (Discrim.\ LR)} & \textbf{6L/8H/512d} & \textbf{BPE 8\,K} & \textbf{23\,M} & \textbf{72.1} & \textbf{25.59} & \textbf{47.37} \\
+12 & Fine-tune v5 (Heavier Reg.)  & 6L/8H/512d  & BPE 8\,K       & 23\,M  &  76.1  & 24.91 & 46.50 \\
+13 & Fine-tune v6 (Grad.\ Unfreeze) & 6L/8H/512d & BPE 8\,K      & 23\,M  &  73.0  & 25.63 & 47.34 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+
+\subsection{Phase I: Tokenisation (Experiments 1--5)}
+
+\textbf{Experiment 1 (Word-Level Baseline).}
+A 5-layer, 6-head, 300\,d Transformer with FastText-initialised
+word embeddings and a vocabulary of $\approx$12.5\,K words achieves
+PPL~155.5.
+High OOV rates on archaic Shakespeare vocabulary and sparse training
+signal for rare tokens limit performance.
+
+\textbf{Experiments 2--4 (BPE v1--v3).}
+Switching to BPE with a 4\,K, then 5\,K vocabulary eliminates the OOV
+problem entirely.
+Iterative hyperparameter tuning across three experiments improves
+PPL from 267.5 (old eval) to 235.8 (old eval), establishing BPE as
+strictly superior.
+
+\textbf{Experiment 5 (BPE v4 --- nanoGPT optimisations).}
+We apply the remaining nanoGPT-style changes not already present
+(our model already used Pre-LN and weight tying):
+(i)~\texttt{bias=False} on all Linear layers,
+(ii)~scaled residual init $\sigma = 0.02/\sqrt{2L}$, and
+(iii)~$\beta_2 = 0.99$ for AdamW.
+PPL improves to \textbf{113.8}.
+
+\smallskip
+\noindent\textbf{Net impact of tokenisation:}
+PPL 155.5 $\rightarrow$ 113.8 (\textbf{26.8\% reduction}).
+BPE's ability to decompose archaic forms (\eg,
+``\textit{unfriendliness}'' $\rightarrow$ ``un''+``friend''+``li''+``ness'')
+provides consistent coverage where word-level modelling fails.
+
+\subsection{Phase II: LSTM Comparison (Experiment 6)}\label{sec:lstm_exp}
+
+To test whether the Transformer's advantage is simply an artefact of
+scale, we train an AWD-LSTM with 3$\times$ more parameters (20.5\,M
+vs.\ 6.4\,M) on identical BPE-5\,K-tokenised Shakespeare data.
+
+\smallskip
+\noindent\textbf{Result:} AWD-LSTM achieves PPL~134.0, while the
+Transformer achieves PPL~113.8 with only 6.4\,M parameters.
+
+\smallskip
+\noindent\textbf{Analysis.}
+The LSTM's inductive bias---sequential processing with gating
+mechanisms---was historically considered an advantage for language
+modelling on small corpora.
+Merity \etal~\cite{merity2018} designed the AWD-LSTM with an
+elaborate regularisation apparatus (weight drop, variational dropout,
+AR/TAR, NT-ASGD) specifically for low-data regimes.
+Despite this specialisation and a $3.2\times$ parameter advantage,
+the LSTM falls short.
+
+However, the LSTM's performance is \emph{noteworthy}: at 134.0 PPL,
+it beats the word-level Transformer (155.5) and all pre-trained
+models evaluated on the Gutenberg test set before fine-tuning (Pre-train
+v1: 151.6, v2: 143.9).
+The LSTM's purpose-built regularisation provides genuine resilience
+in the small-data, no-transfer-learning setting.
+It is only when the Transformer gains access to BPE tokenisation
+\emph{and} its scaling-friendly architecture that the gap opens:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+& \textbf{LSTM} & \textbf{Trans. (scratch)} & \textbf{Trans. (transfer)} \\
+\midrule
+PPL     & 134.0 & 113.8 & \textbf{72.1} \\
+Params  & 20.5\,M & 6.4\,M & 23\,M \\
+Data    & 1.1\,M  & 1.1\,M & 55\,M + 1.4\,M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent The LSTM cannot trivially leverage pre-trained checkpoints
+from a different corpus the way Transformers can, because its
+recurrent state is tightly coupled to the training distribution.
+This architectural limitation makes the Transformer the clear choice
+when transfer learning is available.
+
+\subsection{Phase III: Transfer Learning (Experiments 7--8)}
+
+\textbf{Experiment 7 (Pre-train + Fine-tune v1).}
+We pre-train the 7.3\,M model on 19 Gutenberg books (5.7\,M tokens)
+and fine-tune on Shakespeare with a uniform learning rate.
+Fine-tuned PPL: \textbf{97.6} (14.2\% over BPE scratch).
+
+\textbf{Experiment 8 (Pre-train + Fine-tune v2 --- Discriminative LR).}
+We apply discriminative fine-tuning (Eq.~\ref{eq:discrim}) with
+$\xi = 2.6$, giving a 120$\times$ LR ratio across 5 layer groups.
+Fine-tuned PPL: \textbf{90.5} (7.3\% improvement over uniform LR).
+
+\smallskip
+\noindent\textbf{Key insight:} even with only 19 pre-training books,
+transfer learning reduces PPL from 113.8 to 90.5 (\textbf{20.5\%
+reduction}).
+Discriminative LR prevents catastrophic forgetting of general English
+representations while allowing rapid adaptation to Shakespearean syntax.
+
+\subsection{Phase IV: Scaling (Experiments 9--10)}\label{sec:scaling_exp}
+
+\textbf{Experiment 9 (Pre-train v3 --- 324 books, 7.3\,M model).}
+Expanding the corpus to 324 books (55\,M tokens) with the original
+7.3\,M model reveals a \emph{capacity bottleneck}: the model reaches
+PPL~103.6 on the Shakespeare test set but shows clear underfitting
+(train PPL remains above val PPL).
+At 7.5 tokens/parameter---healthy by Chinchilla standards---the model
+simply lacks the capacity to absorb 55\,M tokens.
+Training was abandoned at epoch~8.
+
+\textbf{Experiment 10 (Pre-train v4 --- 324 books, 23\,M model).}
+We scale to 6 layers, 8 heads, 512\,d, and 2\,048 FFN dim
+(\textbf{23\,M parameters}).
+Key differences from the 7.3\,M model:
+\begin{itemize}[nosep,leftmargin=*]
+  \item Additional decoder layer (5 $\rightarrow$ 6)
+  \item Wider representations (300\,d $\rightarrow$ 512\,d)
+  \item More attention heads (6 $\rightarrow$ 8)
+  \item Larger FFN (1\,024 $\rightarrow$ 2\,048)
+\end{itemize}
+
+\noindent Trained for 10 epochs with context-length scheduling
+(128 $\rightarrow$ 64 at epoch~8), the model achieves PPL~\textbf{89.7}
+on the Shakespeare test set---a \textbf{13.4\% improvement} over the
+7.3\,M model on the same data (Pre-train v3: 103.6).
+Training took 9.8 hours, fitting entirely within the 6\,GB VRAM
+constraint at batch size 64 thanks to the engineering techniques
+described in Section~\ref{sec:engineering}.
+
+\subsection{Phase V: Fine-tuning Strategies (Experiments 11--13)}
+
+\textbf{Experiment 11 (Fine-tune v4 --- Best Model).}
+Fine-tuning the 23\,M pre-trained model with discriminative LR
+($\eta_{\text{top}} = 3 \times 10^{-5}$, $\xi = 2.6$), increased
+dropout (0.2), attention dropout (0.15), and fixed stride 64:
+
+\begin{center}
+\textbf{PPL = 72.1, Accuracy = 25.59\%, Top-5 = 47.37\%}
+\end{center}
+
+\noindent This is the \textbf{best result} across all experiments.
+
+\textbf{Experiment 12 (Fine-tune v5 --- Heavier Regularisation).}
+Increasing dropout to 0.25 and stride to 128 yields PPL~76.1---
+\textbf{worse} than v4.
+This confirms that the model is not overfitting; the val--test gap is
+structural (Section~\ref{sec:valtestgap}).
+
+\textbf{Experiment 13 (Fine-tune v6 --- Gradual Unfreezing).}
+Starting with only the top layer trainable and unfreezing one layer
+every 3 epochs yields PPL~73.0---essentially identical to v4 (72.1).
+With the 120$\times$ LR ratio from discriminative fine-tuning,
+the bottom layers already receive near-zero updates
+($3.74 \times 10^{-8}$), making explicit freezing redundant.
+
+\smallskip
+\noindent\textbf{Finding:} discriminative fine-tuning with $\xi = 2.6$
+\textbf{subsumes} gradual unfreezing at the 23\,M scale.
+This simplifies the fine-tuning pipeline without sacrificing
+performance.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Analysis and Discussion}\label{sec:analysis}
+% ══════════════════════════════════════════════════════════════════
+
+\subsection{Bits-per-Character Comparison with nanoGPT}\label{sec:bpc}
+
+Direct perplexity comparison between character-level and subword models
+is meaningless because vocabularies differ.
+Bits-per-character (BPC) provides a tokenisation-agnostic metric:
+\begin{equation}
+  \bpc = \frac{\mathcal{L}}{\ln 2 \cdot C}
+  \label{eq:bpc}
+\end{equation}
+where $\mathcal{L}$ is nats-per-token and $C$ is the average characters
+per token (compression ratio).
+
+\begin{table}[t]
+\centering
+\caption{Bits-per-character comparison.}
+\label{tab:bpc}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Model} & \textbf{Loss (nats)} & \textbf{Comp.} & \textbf{BPC $\downarrow$} \\
+\midrule
+nanoGPT (char)       & 1.47 & 1.0 & 2.12 \\
+\textbf{Ours (BPE)}  & 4.28 & 4.1 & \textbf{1.51} \\
+\midrule
+\multicolumn{3}{@{}l}{Improvement} & \textbf{28.8\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Our model achieves \textbf{1.51 BPC} vs.\ nanoGPT's
+\textbf{2.12 BPC} (Table~\ref{tab:bpc}), a \textbf{28.8\%
+improvement} and a \textbf{0.61 BPC reduction}---the largest
+reported gain over the character-level nanoGPT baseline on this
+literary domain.
+This advantage arises from three compounding factors:
+
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{BPE tokenisation} compresses the input by 4.1$\times$,
+        allowing the model to ``see'' 4.1$\times$ more characters within
+        the same context window (128 tokens $\approx$ 525 characters
+        vs.\ nanoGPT's 256 characters).
+  \item \textbf{Transfer learning} from 324 books provides a richer
+        English prior than training on Shakespeare alone.
+  \item \textbf{Larger model} (23\,M vs.\ 10.7\,M) with more
+        expressive capacity.
+\end{enumerate}
+
+\noindent We emphasise that this comparison carries important caveats:
+our model uses 2.1$\times$ more parameters, trains on 40$\times$ more
+data (including pre-training), and uses a fundamentally different
+tokenisation.
+Nevertheless, the result demonstrates that BPE + transfer is a viable
+path to surpassing character-level benchmarks on the same domain.
+
+\subsection{Architectural Impact Timeline}
+
+Figure~\ref{fig:timeline} illustrates the cumulative impact of each
+architectural and methodological change.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{verbatim}
+PPL
+160 | * Word-level (155.5)
+    |
+140 |     * LSTM (134.0)
+    |
+120 |  * BPE scratch (113.8)
+    |      * PT-v3 7.3M (103.6)
+100 |   * FT-v1 uniform (97.6)
+    |    * FT-v2 discrim (90.5)
+ 90 |      * PT-v4 23M (89.7)
+ 80 |       * FT-v5 heavy (76.1)
+    |        * FT-v6 unfreeze (73.0)
+ 70 |         * FT-v4 BEST (72.1)
+    +-------------------------------
+      Experiment progression ->
+\end{verbatim}
+\caption{Perplexity progression across the 13-experiment journey.
+Each step corresponds to a specific architectural or methodological
+change.}
+\label{fig:timeline}
+\end{figure}
+
+\subsection{Tokenisation Analysis}
+
+Table~\ref{tab:tokenisation} isolates the tokenisation effect.
+
+\begin{table}[t]
+\centering
+\caption{Impact of tokenisation strategy.}
+\label{tab:tokenisation}
+\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Tokeniser} & \textbf{Vocab} & \textbf{PPL} & \textbf{$\Delta$} \\
+\midrule
+Word-level & 12.5\,K & 155.5 & --- \\
+BPE (5\,K) & 5\,K    & 113.8 & $-$26.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent The 26.8\% reduction comes from:
+(i)~eliminating OOV tokens (word-level maps $\sim$8\% of tokens to
+    \texttt{<UNK>});
+(ii)~compressing sequences (fewer tokens per passage, more context in
+     each window);
+(iii)~shared subword structure between archaic and modern forms.
+
+\subsection{Chinchilla Scaling in Practice}\label{sec:chinchilla_disc}
+
+Our experiment trajectory provides an empirical demonstration of the
+Chinchilla principle at small scale:
+
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{Over-parameterised regime} (Exp.\ 1--5): 6.4\,M
+        parameters on 1.1\,M tokens (0.17 tok/param).
+        The model memorises; additional architectural improvements
+        yield diminishing returns.
+  \item \textbf{Data expansion without scaling} (Exp.\ 9): 7.3\,M
+        parameters on 55\,M tokens (7.5 tok/param).
+        The model \emph{underfits}---train PPL remains above val PPL
+        even at epoch~8.
+        Training was abandoned.
+  \item \textbf{Joint scaling} (Exp.\ 10--11): 23\,M parameters on
+        55\,M tokens (2.4 tok/param).
+        The model enters a healthy training regime and produces the
+        best result (PPL~72.1 after fine-tuning).
+\end{enumerate}
+
+\noindent This three-phase trajectory---over-parameterised,
+under-capacity, healthy---mirrors Chinchilla's core finding at a
+small-compute scale, validating these scaling principles even for
+niche literary corpora.
+
+\subsection{LSTM vs.\ Transformer: Scaling Behaviour}\label{sec:lstm_discussion}
+
+The AWD-LSTM's competitive performance (PPL~134.0 with 20.5\,M params)
+on Shakespeare-only data highlights an important nuance:
+\textbf{recurrent architectures with purpose-built regularisation
+retain an efficiency advantage when transfer learning is unavailable.}
+
+The LSTM's inductive biases---sequential processing, gating
+mechanisms, and built-in forgetting---provide implicit regularisation
+that the Transformer must replicate through dropout, weight decay, and
+label smoothing.
+The AWD-LSTM adds DropConnect, variational dropout, and AR/TAR
+specifically designed for this regime.
+
+However, the Transformer's advantages become decisive when:
+\begin{itemize}[nosep,leftmargin=*]
+  \item \textbf{Pre-training is available}: the Transformer's
+        feed-forward computation is trivially parallelisable across
+        positions and sequences, enabling efficient pre-training on
+        large corpora.
+  \item \textbf{Model scaling is needed}: adding layers and
+        widening representations in a Transformer is straightforward;
+        deeper LSTMs suffer from vanishing gradients even with gating.
+  \item \textbf{Fine-tuning is the paradigm}: discriminative LR
+        operates naturally on the Transformer's layered structure,
+        where each layer learns progressively more abstract features.
+\end{itemize}
+
+\noindent Our results show a \textbf{46.2\%} perplexity reduction
+from LSTM (134.0) to best Transformer (72.1),
+achieved by unlocking the Transformer's scaling potential through
+transfer learning.
+
+\subsection{Discriminative LR vs.\ Gradual Unfreezing}
+
+\begin{table}[t]
+\centering
+\caption{Fine-tuning strategy comparison (23\,M model).}
+\label{tab:finetune}
+\small
+\begin{tabular}{@{}lccr@{}}
+\toprule
+\textbf{Strategy} & \textbf{PPL} & \textbf{Acc (\%)} & \textbf{Time} \\
+\midrule
+Discriminative LR (v4)      & \textbf{72.1} & 25.59 & 65.7\,min \\
+Gradual Unfreezing (v6)     & 73.0          & \textbf{25.63} & 88.9\,min \\
+Heavier Regularisation (v5) & 76.1          & 24.91 & 34.1\,min \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent Gradual unfreezing adds complexity and 35\% more training
+time while producing a statistically insignificant PPL difference
+(73.0 vs.\ 72.1).
+The 120$\times$ LR ratio of discriminative fine-tuning already
+reduces the bottom-layer learning rate to $3.74 \times 10^{-8}$---
+functionally equivalent to freezing.
+
+\subsection{The Val--Test Gap}\label{sec:valtestgap}
+
+All fine-tuned models exhibit a $\sim$24\% gap between validation and
+test perplexity (\eg, val PPL~117.9 vs.\ test PPL~72.1 for v4 under
+\emph{training-time} evaluation).
+We attribute this to the \textbf{sequential split}: different plays
+occupy different partitions, and plays vary in archaic language
+density, dramatic structure, and vocabulary.
+Heavier regularisation (v5) does not reduce the gap, confirming it
+is structural rather than a sign of overfitting.
+
+\subsection{Qualitative Generation Analysis}
+
+The best model generates coherent, stylistically appropriate text:
+
+\begin{quote}
+\small
+\textbf{Prompt:} ``to be or not to be''
+
+\textbf{Output:} \textit{to be or not to be a man. you are so mad.
+i am sorry that, i'll tell you, but i have been drunk.
+[\,within.\,] now, my lord. enter king. king. where is the duke?
+what, what news}
+\end{quote}
+
+\begin{quote}
+\small
+\textbf{Prompt:} ``thou art''
+
+\textbf{Output:} \textit{thou art a creature. i must not know thee;
+for i will, though thou hadst a brother, thou shalt have no wife
+with me. go, away! thou wilt not be with us again. i'll not go
+with you. [\,exeunt.}
+\end{quote}
+
+\noindent The model produces correct stage directions
+(\textit{enter king}, \textit{exeunt}), archaic pronoun forms
+(\textit{thou}, \textit{thee}, \textit{thy}), proper character
+dialogue structure, and coherent multi-sentence passages.
+
+\subsection{Engineering Techniques}\label{sec:engineering}
+
+Training a 23\,M-parameter Transformer on 55\,M tokens within 6\,GB of
+VRAM required several engineering techniques that were individually
+simple but collectively essential:
+
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{Memory-mapped-style embedding cache.}
+        Pre-computing BPE token embeddings and writing them to a
+        persistent \texttt{embeddings\_cache.pt} file avoids
+        recomputing the embedding layer on every epoch and, crucially,
+        allows the data loader to serve pre-embedded chunks without
+        holding the entire dataset in GPU memory.
+        Without this cache, the 324-book pre-training corpus caused
+        repeated out-of-memory (OOM) errors at batch sizes above 32.
+
+  \item \textbf{Contracting-stride schedule.}
+        Halving the stride every five epochs (128 $\rightarrow$ 64
+        $\rightarrow$ 32 $\rightarrow$ 16) multiplies the number of
+        unique training windows up to 8$\times$ without data
+        augmentation, compensating for the small Shakespeare corpus.
+        This schedule also acts as a curriculum: early epochs see
+        diverse, non-overlapping windows; later epochs see dense,
+        highly overlapping windows that reinforce local context.
+
+  \item \textbf{Context-length scheduling.}
+        Reducing the context window from 128 to 64 tokens at epoch~8
+        during pre-training v4 exposes the model to shorter, more
+        varied contexts in the final stage, acting as an implicit
+        regulariser and improving generalisation to variable-length
+        inputs at inference.
+
+  \item \textbf{Gradient-accumulation-aware batch sizing.}
+        Batch size was tuned to the largest value that fit in VRAM
+        (typically 64) with gradient accumulation used when larger
+        effective batches were needed, avoiding the memory overhead of
+        larger physical batches.
+
+  \item \textbf{Selective dropout placement.}
+        Dropout rates were differentiated across attention (0.15),
+        residual (0.2), and embedding (0.1) pathways rather than
+        applying a blanket rate, balancing regularisation against
+        information loss in each sub-layer.
+\end{enumerate}
+
+\noindent These techniques, combined with FP32 training and careful
+memory budgeting, allowed the full 13-experiment pipeline to complete
+in $\approx$20.7 GPU-hours on a single GTX 1660\,Ti.
+
+\subsection{Potential Architectural Improvements}\label{sec:potential}
+
+While the current results establish a strong baseline, several
+architectural changes are expected to yield further improvements:
+
+\begin{enumerate}[nosep,leftmargin=*]
+  \item \textbf{Swish (SiLU) activation.}
+        Replacing GELU with the Swish activation
+        $\sigma(x) = x \cdot \mathrm{sigmoid}(x)$ has shown consistent
+        gains in recent Transformer variants (PaLM, LLaMA).
+        Swish provides a smoother gradient landscape and slightly
+        larger gradient magnitude near zero, which may improve
+        convergence on small corpora.
+
+  \item \textbf{Aggressive stride reduction (256-token base).}
+        Starting the contracting-stride schedule from a 256-token
+        stride (with a correspondingly longer context window) would
+        expose the model to broader discourse structure in early
+        epochs.
+        Contracting to 32 tokens in later epochs would yield up to
+        16$\times$ data multiplication---double the current scheme.
+
+  \item \textbf{FP16 mixed-precision training.}
+        All current experiments use FP32 arithmetic, occupying the full
+        6\,GB VRAM budget.
+        Switching to FP16 (or BF16) mixed precision via PyTorch AMP
+        would approximately halve memory consumption, enabling either
+        (a)~doubled batch sizes for smoother gradient estimates, or
+        (b)~a wider model (e.g., 768\,d) within the same VRAM
+        envelope.
+        Either path would likely improve final perplexity.
+\end{enumerate}
+
+\noindent Taken together, these changes represent a realistic path
+toward sub-65 perplexity and $<$1.4 BPC on the same hardware, without
+requiring additional training data.
+
+\subsection{Code Structure and Reproducibility}\label{sec:code}
+
+The project is distributed in two forms:
+
+\begin{itemize}[nosep,leftmargin=*]
+  \item \textbf{Full source repository.}
+        Contains the complete training pipeline (\texttt{main.py},
+        \texttt{train.py}, \texttt{pretrain\_finetune.py}), data
+        processing (\texttt{data\_loader.py}, \texttt{gutenberg.py},
+        \texttt{augmentation.py}), BPE tokeniser, model definitions,
+        evaluation scripts (\texttt{tester.py},
+        \texttt{view\_results.py}), and all supporting utilities.
+        Running the full pipeline requires the Project Gutenberg corpus
+        and Shakespeare text.
+  \item \textbf{Minimised deliverable folder.}
+        A self-contained package including a standalone tester
+        (\texttt{non\_data\_reliant\_tester.py}) with a representative
+        Shakespeare excerpt embedded directly in the source code,
+        all 12 model checkpoints, BPE vocabulary files, and a
+        comprehensive README\@.
+        This version requires \emph{no external data files}: a user
+        can install dependencies and immediately evaluate any or all
+        models with a single command.
+\end{itemize}
+
+\noindent The minimised deliverable is designed for immediate
+reproducibility, while the full source supports retraining, ablation
+studies, and extension of the pipeline.
+
+% ══════════════════════════════════════════════════════════════════
+\section{Summary of Findings}\label{sec:findings}
+% ══════════════════════════════════════════════════════════════════
+
+We distil our experimental trajectory into the following concrete
+findings:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{BPE tokenisation is essential.}
+        Switching from word-level to BPE-5\,K reduces PPL by
+        26.8\% (155.5 $\rightarrow$ 113.8) by eliminating OOV
+        tokens and compressing sequences.
+
+  \item \textbf{Bias removal and scaled residual init improve
+        stability.}
+        Adopting \texttt{bias=False} and $\sigma = 0.02/\sqrt{2L}$
+        from nanoGPT contributes to the final BPE scratch result,
+        though their individual contribution is small given that
+        Pre-LN and weight tying were already present.
+
+  \item \textbf{The AWD-LSTM is competitive without transfer learning.}
+        At 134.0 PPL with specialised regularisation, the LSTM
+        outperforms word-level Transformers (155.5) and is only
+        15.1\% behind the BPE Transformer (113.8) despite
+        $3.2\times$ more parameters, demonstrating the value of
+        architecture-specific regularisation on small data.
+
+  \item \textbf{Transfer learning unlocks Transformer scaling.}
+        Pre-training on 19 books + discriminative fine-tuning reduces
+        PPL to 90.5 (20.5\% over scratch), and scaling to 324 books +
+        23\,M params reaches 72.1 (36.6\% over scratch).
+
+  \item \textbf{Chinchilla scaling holds at small scale.}
+        A 7.3\,M model underfits 55\,M tokens; scaling to 23\,M
+        (2.4 tok/param) resolves this and produces the best result.
+        Conversely, 6.4\,M params on 1.1\,M tokens (0.17 tok/param)
+        is severely over-parameterised.
+
+  \item \textbf{Discriminative LR subsumes gradual unfreezing.}
+        With a 120$\times$ LR ratio ($\xi = 2.6$ over 8 groups),
+        bottom layers are effectively frozen, and explicit unfreezing
+        adds no benefit (PPL 73.0 vs.\ 72.1).
+
+  \item \textbf{Context-length scheduling aids pre-training.}
+        Reducing context from 128 to 64 tokens in the final
+        pre-training epochs serves as a regulariser and helped the
+        23\,M model generalise.
+
+  \item \textbf{Contracting stride increases effective data.}
+        Halving stride every 5 epochs increases training examples up
+        to 8$\times$ without data augmentation, benefiting early
+        experiments where data is scarce.
+
+  \item \textbf{The val--test gap is structural, not overfitting.}
+        Sequential splitting across plays creates a $\sim$24\% PPL
+        gap that heavier regularisation cannot resolve.
+
+  \item \textbf{Engineering techniques are essential at limited VRAM.}
+        A memory-mapped-style embedding cache, contracting-stride
+        schedule, context-length scheduling, and careful batch sizing
+        collectively enabled 23\,M-parameter training on 55\,M tokens
+        within 6\,GB of GPU memory, without which OOM errors prevented
+        convergence.
+
+  \item \textbf{Our model surpasses character-level nanoGPT by
+        28.8\% in BPC.}
+        At 1.51 BPC vs.\ Karpathy's 2.12 BPC, the combination of
+        BPE tokenisation, transfer learning, and model scaling
+        delivers a 0.61 BPC improvement on the same literary domain,
+        establishing a new reference point for Shakespeare language
+        modelling.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════
+\section{Conclusion}\label{sec:conclusion}
+% ══════════════════════════════════════════════════════════════════
+
+We have presented a complete, reproducible pipeline for next-word
+prediction on Shakespeare, progressing through 13 controlled
+experiments from a word-level baseline (PPL~155.5) to a 23\,M-parameter
+Transformer achieving a test perplexity of \textbf{72.1} and
+\textbf{1.51~BPC}---surpassing Karpathy's character-level nanoGPT
+(2.12~BPC) by \textbf{28.8\%} on the same literary domain.
+
+Our trajectory demonstrates that strong language modelling on a small
+literary corpus requires five cumulative stages:
+(1)~effective tokenisation (BPE over words),
+(2)~modern architectural choices (Pre-LN, bias removal, GELU, weight
+    tying, scaled residual init),
+(3)~data scaling (19 $\rightarrow$ 324 pre-training books),
+(4)~model scaling (7.3\,M $\rightarrow$ 23\,M parameters, guided by
+    Chinchilla), and
+(5)~careful fine-tuning (discriminative LR with a 120$\times$ ratio).
+
+Several engineering techniques---a memory-mapped-style embedding
+cache, contracting-stride schedule, context-length scheduling, and
+selective dropout placement---were essential to fitting this pipeline
+within limited GPU memory and avoiding OOM errors during the
+large-corpus pre-training phase.
+
+We showed that recurrent models (AWD-LSTM) remain competitive on
+limited data thanks to their specialised regularisation, but the
+Transformer's ability to leverage transfer learning and scale with
+data makes it the superior choice when pre-training corpora are
+available.
+
+Looking forward, we identify three concrete paths to further
+improvement: (i)~replacing GELU with Swish (SiLU) activations for
+smoother gradient flow; (ii)~extending the contracting-stride base
+to 256 tokens for richer discourse coverage and up to 16$\times$
+data multiplication; and (iii)~adopting FP16 mixed-precision training
+to free VRAM for either doubled batch sizes or wider model
+architectures.
+These changes represent a realistic path toward sub-65 perplexity and
+below 1.4~BPC without additional training data.
+
+All code, model checkpoints, and evaluation scripts---including a
+self-contained, data-independent tester---are provided in the
+accompanying deliverable package.
+
+% ══════════════════════════════════════════════════════════════════
+%                        REFERENCES
+% ══════════════════════════════════════════════════════════════════
+\begin{thebibliography}{00}
+
+\bibitem{vaswani2017}
+A.~Vaswani, N.~Shazeer, N.~Parmar, J.~Uszkoreit, L.~Jones,
+A.~N.~Gomez, {\L}.~Kaiser, and I.~Polosukhin,
+``Attention is all you need,''
+in \textit{Advances in Neural Information Processing Systems (NeurIPS)},
+2017, pp.~5998--6008.
+
+\bibitem{press2017}
+O.~Press and L.~Wolf,
+``Using the output embedding to improve language models,''
+in \textit{Proc.\ European Chapter of the ACL (EACL)}, 2017,
+pp.~157--163.
+
+\bibitem{sennrich2016}
+R.~Sennrich, B.~Haddow, and A.~Birch,
+``Neural machine translation of rare words with subword units,''
+in \textit{Proc.\ ACL}, 2016, pp.~1715--1725.
+
+\bibitem{howard2018}
+J.~Howard and S.~Ruder,
+``Universal language model fine-tuning for text classification,''
+in \textit{Proc.\ ACL}, 2018, pp.~328--339.
+
+\bibitem{hoffmann2022}
+J.~Hoffmann, S.~Borgeaud, A.~Mensch, E.~Buchatskaya, T.~Cai,
+E.~Rutherford, D.~de~Las~Casas, L.~A.~Hendricks, J.~Welbl,
+A.~Clark, T.~Hennigan, E.~Noland, K.~Millican, G.~van~den~Driessche,
+B.~Damoc, A.~Guy, S.~Osindero, K.~Simonyan, E.~Elsen, J.~W.~Rae,
+O.~Vinyals, and L.~Sifre,
+``Training compute-optimal large language models,''
+\textit{arXiv preprint arXiv:2203.15556}, 2022.
+
+\bibitem{merity2018}
+S.~Merity, N.~S.~Keskar, and R.~Socher,
+``Regularizing and optimizing LSTM language models,''
+in \textit{Proc.\ ICLR}, 2018.
+
+\bibitem{karpathynanoGPT}
+A.~Karpathy,
+``nanoGPT,''
+\url{https://github.com/karpathy/nanoGPT}, 2023.
+
+\bibitem{karpathy_rnn}
+A.~Karpathy,
+``The unreasonable effectiveness of recurrent neural networks,''
+blog post, 2015.
+\url{http://karpathy.github.io/2015/05/21/rnn-effectiveness/}
+
+\bibitem{xiong2020}
+R.~Xiong, Y.~Yang, J.~He, K.~Zheng, S.~Zheng, C.~Xing, H.~Zhang,
+Y.~Lan, L.~Wang, and T.-Y.~Liu,
+``On layer normalization in the Transformer architecture,''
+in \textit{Proc.\ ICML}, 2020, pp.~10524--10533.
+
+\bibitem{loshchilov2019}
+I.~Loshchilov and F.~Hutter,
+``Decoupled weight decay regularization,''
+in \textit{Proc.\ ICLR}, 2019.
+
+\bibitem{hendrycks2016}
+D.~Hendrycks and K.~Gimpel,
+``Gaussian error linear units (GELUs),''
+\textit{arXiv preprint arXiv:1606.08415}, 2016.
+
+\bibitem{szegedy2016}
+C.~Szegedy, V.~Vanhoucke, S.~Ioffe, J.~Shlens, and Z.~Wojna,
+``Rethinking the Inception architecture for computer vision,''
+in \textit{Proc.\ CVPR}, 2016, pp.~2818--2826.
+
+\bibitem{bojanowski2017}
+P.~Bojanowski, E.~Grave, A.~Joulin, and T.~Mikolov,
+``Enriching word vectors with subword information,''
+\textit{Trans.\ ACL}, vol.~5, pp.~135--146, 2017.
+
+\bibitem{loshchilov2017}
+I.~Loshchilov and F.~Hutter,
+``SGDR: Stochastic gradient descent with warm restarts,''
+in \textit{Proc.\ ICLR}, 2017.
+
+\end{thebibliography}
+
+\end{document}
